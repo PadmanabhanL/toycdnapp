@@ -1,110 +1,89 @@
 package com.app.cdn;
 
-import com.app.cdn.bo.ResponseWrapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
-import java.io.*;
-import java.net.*;
-import java.net.http.*;
-import java.nio.file.*;
-import java.time.*;
-import java.util.*;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 public class CDNMain {
 
     public static final int SERVER_PORT = 8001;
     public static final String TARGET_URL = "https://images.unsplash.com";
-    public static Map<String, ResponseWrapper> cache = new ConcurrentHashMap<>();
-
-    public static ExecutorService executorService = Executors.newFixedThreadPool(100);
+    private static final Map<String, byte[]> cache = new ConcurrentHashMap<>();
 
     public static void main(String[] args) throws IOException {
-
-        CDNMain app = new CDNMain();
-
         HttpServer httpServer = HttpServer.create(new InetSocketAddress(SERVER_PORT), 0);
         httpServer.createContext("/", exchange -> {
-            executorService.submit(() -> {
-                try {
-                    app.handleRequest(exchange);
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            });
+            handleRequest(exchange);
         });
-        httpServer.setExecutor(executorService);
 
         httpServer.start();
         System.out.println("Server started on port " + SERVER_PORT);
     }
 
-    private void handleRequest(HttpExchange exchange) throws IOException {
+    private static void handleRequest(HttpExchange exchange) throws IOException {
         String requestUrl = exchange.getRequestURI().toString();
+
+        byte[] cachedResponse = cache.get(requestUrl);
+        if (cachedResponse != null) {
+            System.out.println("Serving from cache: " + requestUrl);
+            sendResponse(exchange, cachedResponse);
+            return;
+        }
+
         String targetUrl = TARGET_URL + requestUrl;
 
+        HttpClient httpClient = HttpClient.newBuilder()
+                                          .version(HttpClient.Version.HTTP_1_1)
+                                          .connectTimeout(Duration.ofSeconds(10))
+                                          .build();
 
-        String fileName = getFileNameFromUrl(requestUrl);
+        HttpRequest httpRequest = HttpRequest.newBuilder()
+                                             .uri(URI.create(targetUrl))
+                                             .build();
 
-        if (cache.containsKey(fileName)) {
+        try {
+            HttpResponse<InputStream> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
 
-            System.out.println("serving from cache for "+ fileName);
+            byte[] responseBody = readInputStream(response.body());
+            cache.put(requestUrl, responseBody);
 
-            redirectResponse(exchange, cache.get(fileName).getStatusCode(), cache.get(fileName).getBody());
-        } else {
 
-            HttpClient httpClient = HttpClient.newBuilder()
-                                              .version(HttpClient.Version.HTTP_1_1)
-                                              .connectTimeout(Duration.ofSeconds(10))
-                                              .build();
-
-            HttpRequest httpRequest = HttpRequest.newBuilder()
-                                                 .uri(URI.create(targetUrl))
-                                                 .build();
-
-            try {
-                HttpResponse<InputStream> response = httpClient.send(httpRequest,
-                                                                     HttpResponse.BodyHandlers.ofInputStream());
-
-                InputStream body = response.body();
-
-                // Set response headers and status code
-                HttpHeaders headers = response.headers();
-                exchange.getResponseHeaders().putAll(headers.map());
-                int statusCode = response.statusCode();
-
-                cache.put(fileName, new ResponseWrapper(headers, body, statusCode));
-
-                redirectResponse(exchange, statusCode, body);
-            } catch (InterruptedException e) {
-                exchange.sendResponseHeaders(500, 0); // Internal server error
-            } finally {
-                exchange.close();
-            }
-        }
-
-        // Send the request and handle the response
-
-    }
-
-    private static void redirectResponse(HttpExchange exchange, int statusCode, InputStream responseBody) throws
-                                                                                                          IOException {
-        exchange.sendResponseHeaders(statusCode, 0);
-
-        // Write response body to client
-        try (OutputStream respStream = exchange.getResponseBody()) {
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = responseBody.read(buffer)) != -1) {
-                respStream.write(buffer, 0, bytesRead);
-            }
+            sendResponse(exchange, responseBody);
+        } catch (InterruptedException e) {
+            exchange.sendResponseHeaders(500, 0); // Internal server error
+        } finally {
+            exchange.close();
         }
     }
 
-    private static String getFileNameFromUrl(String url) {
-        return url.substring(url.lastIndexOf('/') + 1); // Extract filename from URL
+    private static void sendResponse(HttpExchange exchange, byte[] responseBody) throws IOException {
+        exchange.getResponseHeaders().add("Content-Type", "image/jpeg");
+        exchange.sendResponseHeaders(200, responseBody.length);
+
+        try (OutputStream responseStream = exchange.getResponseBody()) {
+            responseStream.write(responseBody);
+        }
+    }
+
+    private static byte[] readInputStream(InputStream inputStream) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] data = new byte[8192];
+        int bytesRead;
+        while ((bytesRead = inputStream.read(data, 0, data.length)) != -1) {
+            buffer.write(data, 0, bytesRead);
+        }
+        return buffer.toByteArray();
     }
 }
